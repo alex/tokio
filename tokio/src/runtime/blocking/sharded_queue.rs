@@ -79,18 +79,6 @@ pub(super) struct ShardedQueue {
     condvar: Condvar,
     /// Mutex to pair with the condvar. Only held during wait, not during push/pop.
     condvar_mutex: Mutex<()>,
-    /// Tracks pending wakeup notifications.
-    ///
-    /// When a task is pushed, we increment this counter and signal the condvar.
-    /// When a worker wakes up, it decrements this counter (if positive) to "claim"
-    /// the notification. This helps workers distinguish between:
-    /// - Waking up because a task was pushed (counter was positive)
-    /// - Spurious wakeup from the condvar (counter was zero)
-    ///
-    /// Multiple workers may race to decrement the counter, which is fine - the
-    /// worker that successfully decrements will likely find the task, while
-    /// others will re-check and either find other tasks or go back to sleep.
-    num_notify: AtomicUsize,
 }
 
 /// Calculate the effective number of shards to use based on thread count.
@@ -114,7 +102,6 @@ impl ShardedQueue {
             shutdown: AtomicBool::new(false),
             condvar: Condvar::new(),
             condvar_mutex: Mutex::new(()),
-            num_notify: AtomicUsize::new(0),
         }
     }
 
@@ -135,7 +122,6 @@ impl ShardedQueue {
 
     /// Notify one waiting worker that a task is available.
     pub(super) fn notify_one(&self) {
-        self.num_notify.fetch_add(1, Release);
         self.condvar.notify_one();
     }
 
@@ -227,22 +213,6 @@ impl ShardedQueue {
 
         if self.is_shutdown() {
             return WaitResult::Shutdown;
-        }
-
-        // Try to claim a pending notification by decrementing the counter.
-        // This is a compare-and-swap loop that only decrements if positive.
-        loop {
-            let current = self.num_notify.load(Acquire);
-            if current == 0 {
-                break;
-            }
-            match self
-                .num_notify
-                .compare_exchange_weak(current, current - 1, Release, Relaxed)
-            {
-                Ok(_) => break,
-                Err(_) => continue,
-            }
         }
 
         // Try to get a task
