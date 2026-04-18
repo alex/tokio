@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::time::Duration;
 
-use super::pool::Task;
+use super::pool::{SpawnerMetrics, Task};
 
 /// Number of shards. Must be a power of 2.
 /// Under loom, use a single shard to keep the state space tractable —
@@ -152,6 +152,30 @@ impl ShardedQueue {
         self.condvar.notify_one();
     }
 
+    /// Attempt to atomically claim an idle worker and deliver a
+    /// notification to it. Returns `true` if a slot was claimed and the
+    /// caller should consider the task "handed off" to a worker; returns
+    /// `false` if there is no currently-idle worker (the caller should
+    /// consider spawning a new worker).
+    ///
+    /// The claim both decrements `num_idle_threads` (transferring
+    /// ownership of an idle slot to the new task) and increments the
+    /// notification counter. All three operations happen while holding
+    /// `condvar_mutex`, which is the same lock that `wait_for_task`
+    /// takes; this makes the claim atomic with respect to the worker's
+    /// transition between the idle and busy states.
+    pub(super) fn try_claim_idle_and_notify(&self, metrics: &SpawnerMetrics) -> bool {
+        let mut guard = self.condvar_mutex.lock();
+        if metrics.num_idle_threads() == 0 {
+            return false;
+        }
+        metrics.dec_num_idle_threads();
+        *guard += 1;
+        drop(guard);
+        self.condvar.notify_one();
+        true
+    }
+
     /// Try to pop a task, checking the preferred shard first, then others.
     pub(super) fn pop(&self, preferred_shard: usize) -> Option<Task> {
         // Check shards starting from preferred, wrapping around
@@ -184,31 +208,56 @@ impl ShardedQueue {
     }
 
     /// Wait for a task notification with timeout. Returns when a task has
-    /// been pushed (the caller should then `pop`), shutdown occurs, or the
-    /// wait times out.
+    /// been handed off from a spawner, shutdown occurs, or the wait times
+    /// out.
+    ///
+    /// `num_idle_threads` is managed entirely by this function. On entry
+    /// we increment the idle counter (under `condvar_mutex`) to advertise
+    /// this worker as available; we decrement the counter when returning
+    /// `Shutdown` or `Timeout` (the worker is leaving the idle state
+    /// without a hand-off). A `Task` return means a concurrent spawner
+    /// called `try_claim_idle_and_notify`, which decremented the idle
+    /// counter as part of the claim — so this function does not
+    /// decrement on the `Task` path.
     ///
     /// Uses a notification counter under `condvar_mutex` to prevent lost
     /// wakeups — the same pattern as the original single-mutex blocking pool.
-    pub(super) fn wait_for_task(&self, preferred_shard: usize, timeout: Duration) -> WaitResult {
+    pub(super) fn wait_for_task(
+        &self,
+        metrics: &SpawnerMetrics,
+        preferred_shard: usize,
+        timeout: Duration,
+    ) -> WaitResult {
         let mut guard = self.condvar_mutex.lock();
+        // Advertise this worker as idle (under the lock so it is atomic
+        // with respect to `try_claim_idle_and_notify`).
+        metrics.inc_num_idle_threads();
 
         loop {
             if self.is_shutdown() {
+                // Leaving the idle state without a claim; relinquish our
+                // idle slot.
+                metrics.dec_num_idle_threads();
                 return WaitResult::Shutdown;
             }
 
             if *guard > 0 {
-                // A notification is pending — a task was pushed.
+                // A notification is pending — a spawner claimed this
+                // worker (the spawner already decremented
+                // `num_idle_threads`).
                 *guard -= 1;
                 drop(guard);
                 // Pop outside the condvar_mutex to avoid holding two locks.
                 if let Some(task) = self.pop(preferred_shard) {
                     return WaitResult::Task(task);
                 }
-                // The task was already consumed in the caller's BUSY loop
-                // (race between push+notify and the worker's pop loop).
-                // Re-enter the wait.
+                // The task was already consumed elsewhere (e.g. a BUSY
+                // loop of a concurrent worker). The spawner had
+                // transferred an idle slot to us; re-acquire it and
+                // go back to waiting so the pool's accounting stays
+                // consistent.
                 guard = self.condvar_mutex.lock();
+                metrics.inc_num_idle_threads();
                 continue;
             }
 
@@ -218,8 +267,10 @@ impl ShardedQueue {
             if timeout_result.timed_out() && *guard == 0 {
                 // Double-check: shutdown may have raced with the timeout.
                 if self.is_shutdown() {
+                    metrics.dec_num_idle_threads();
                     return WaitResult::Shutdown;
                 }
+                metrics.dec_num_idle_threads();
                 return WaitResult::Timeout;
             }
             // Woken by notify or spurious wakeup — loop back to check.

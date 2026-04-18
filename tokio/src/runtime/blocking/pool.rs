@@ -39,7 +39,7 @@ impl SpawnerMetrics {
         self.num_threads.load(Ordering::Relaxed)
     }
 
-    fn num_idle_threads(&self) -> usize {
+    pub(super) fn num_idle_threads(&self) -> usize {
         self.num_idle_threads.load(Ordering::Relaxed)
     }
 
@@ -57,11 +57,11 @@ impl SpawnerMetrics {
         self.num_threads.decrement();
     }
 
-    fn inc_num_idle_threads(&self) {
+    pub(super) fn inc_num_idle_threads(&self) {
         self.num_idle_threads.increment();
     }
 
-    fn dec_num_idle_threads(&self) -> usize {
+    pub(super) fn dec_num_idle_threads(&self) -> usize {
         self.num_idle_threads.decrement()
     }
 
@@ -403,59 +403,75 @@ impl Spawner {
         self.inner.queue.push(task);
         self.inner.metrics.inc_queue_depth();
 
-        // Check if we need to spawn a new thread or notify an idle one
-        if self.inner.metrics.num_idle_threads() == 0 {
-            // No idle threads - might need to spawn one
-            if self.inner.metrics.num_threads() < self.inner.thread_cap {
-                // Try to spawn a new thread
-                let mut shared = self.inner.shared.lock();
+        // Try to claim an idle worker under the condvar mutex. This is
+        // atomic with respect to a worker's transition out of the idle
+        // state: a worker that has woken up from `wait_for_task` (and
+        // will therefore pop this or some other task) releases its idle
+        // slot inside `try_claim_idle_and_notify` / on timeout, so a
+        // successful claim guarantees that a worker is actually waiting
+        // to run a task.
+        //
+        // If no slot was available, fall through to the spawn path,
+        // which may spawn a new worker under the `shared` mutex.
+        if self.inner.queue.try_claim_idle_and_notify(&self.inner.metrics) {
+            return Ok(());
+        }
 
-                // Double-check conditions after acquiring the lock
-                if shared.shutdown {
-                    // Shutdown raced with our push. The task is in the
-                    // sharded queue but workers may have already exited.
-                    // Drain it here so mandatory tasks still run.
-                    drop(shared);
-                    while let Some(task) = self.inner.queue.pop(0) {
-                        self.inner.metrics.dec_queue_depth();
-                        task.shutdown_or_run_if_mandatory();
-                    }
-                    return Ok(());
+        // No idle thread was available. Might need to spawn one.
+        if self.inner.metrics.num_threads() < self.inner.thread_cap {
+            let mut shared = self.inner.shared.lock();
+
+            // Double-check conditions after acquiring the lock.
+            if shared.shutdown {
+                // Shutdown raced with our push. The task is in the
+                // sharded queue but workers may have already exited.
+                // Drain it here so mandatory tasks still run.
+                drop(shared);
+                while let Some(task) = self.inner.queue.pop(0) {
+                    self.inner.metrics.dec_queue_depth();
+                    task.shutdown_or_run_if_mandatory();
                 }
+                return Ok(());
+            }
 
-                // Re-check thread count (another thread might have spawned one)
-                if self.inner.metrics.num_threads() < self.inner.thread_cap {
-                    if let Some(shutdown_tx) = shared.shutdown_tx.clone() {
-                        let id = shared.worker_thread_index;
+            // Re-check for idle workers that may have become available
+            // while we were acquiring the shared lock. This closes the
+            // race between `try_claim_idle_and_notify` returning false
+            // and a worker entering the idle state.
+            if self.inner.queue.try_claim_idle_and_notify(&self.inner.metrics) {
+                return Ok(());
+            }
 
-                        match self.spawn_thread(shutdown_tx, rt, id) {
-                            Ok(handle) => {
-                                self.inner.metrics.inc_num_threads();
-                                shared.worker_thread_index += 1;
-                                shared.worker_threads.insert(id, handle);
-                            }
-                            Err(ref e)
-                                if is_temporary_os_thread_error(e)
-                                    && self.inner.metrics.num_threads() > 0 =>
-                            {
-                                // OS temporarily failed to spawn a new thread.
-                                // The task will be picked up eventually by a currently
-                                // busy thread.
-                            }
-                            Err(e) => {
-                                // The OS refused to spawn the thread and there is no thread
-                                // to pick up the task that has just been pushed to the queue.
-                                return Err(SpawnError::NoThreads(e));
-                            }
+            // Re-check thread count (another thread might have spawned one).
+            if self.inner.metrics.num_threads() < self.inner.thread_cap {
+                if let Some(shutdown_tx) = shared.shutdown_tx.clone() {
+                    let id = shared.worker_thread_index;
+
+                    match self.spawn_thread(shutdown_tx, rt, id) {
+                        Ok(handle) => {
+                            self.inner.metrics.inc_num_threads();
+                            shared.worker_thread_index += 1;
+                            shared.worker_threads.insert(id, handle);
+                        }
+                        Err(ref e)
+                            if is_temporary_os_thread_error(e)
+                                && self.inner.metrics.num_threads() > 0 =>
+                        {
+                            // OS temporarily failed to spawn a new thread.
+                            // The task will be picked up eventually by a currently
+                            // busy thread.
+                        }
+                        Err(e) => {
+                            // The OS refused to spawn the thread and there is no thread
+                            // to pick up the task that has just been pushed to the queue.
+                            return Err(SpawnError::NoThreads(e));
                         }
                     }
                 }
-            } else {
-                // At max threads, notify anyway in case threads are waiting
-                self.inner.queue.notify_one();
             }
         } else {
-            // There are idle threads waiting, notify one
+            // At max threads, wake anyone waiting in case the race above
+            // missed an idle worker that has since parked.
             self.inner.queue.notify_one();
         }
 
@@ -529,22 +545,21 @@ impl Inner {
                 break;
             }
 
-            // IDLE: Wait for new tasks (spurious wakeups handled internally)
-            self.metrics.inc_num_idle_threads();
-
-            match self.queue.wait_for_task(preferred_shard, self.keep_alive) {
+            // IDLE: Wait for new tasks. `wait_for_task` manages the
+            // `num_idle_threads` counter atomically with respect to
+            // spawners that may claim this thread via
+            // `try_claim_idle_and_notify`.
+            match self.queue.wait_for_task(&self.metrics, preferred_shard, self.keep_alive) {
                 WaitResult::Task(task) => {
-                    self.metrics.dec_num_idle_threads();
+                    // NOTE: the spawner already decremented
+                    // `num_idle_threads` when it claimed this thread.
                     self.metrics.dec_queue_depth();
                     task.run();
                 }
                 WaitResult::Shutdown => {
-                    self.metrics.dec_num_idle_threads();
                     break 'main;
                 }
                 WaitResult::Timeout => {
-                    self.metrics.dec_num_idle_threads();
-
                     // Clean up thread handle
                     let mut shared = self.shared.lock();
                     if !shared.shutdown {
